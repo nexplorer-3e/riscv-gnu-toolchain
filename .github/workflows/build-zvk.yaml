@@ -1,0 +1,118 @@
+name: Build custom march
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - '*'
+  workflow_dispatch:
+    {}
+      
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:   [linux, musl, newlib]
+        target: [rv64gcv_zvksc_zvkng-lp64d]
+        compiler: [gcc, llvm]
+        exclude:
+          - mode: musl
+            target: rv32gc-ilp32d
+          - mode: musl
+            compiler: llvm
+    steps:
+      - uses: actions/checkout@v3
+      - name: Free Disk Space for LLVM
+        uses: insightsengineering/disk-space-reclaimer@v1
+      - name: install dependencies
+        run: sudo ./.github/setup-apt.sh
+
+      - name: build toolchain
+        run: |
+          TARGET_TUPLE=($(echo ${{ matrix.target }} | tr "-" "\n"))
+          BUILD_TOOLCHAIN="./configure --prefix=/opt/riscv --with-arch=${TARGET_TUPLE[0]} --with-abi=${TARGET_TUPLE[1]}"
+          if [ "${{ matrix.compiler }}" == "llvm" ]; then # build toolchain with llvm
+            $BUILD_TOOLCHAIN --enable-llvm
+          else
+            $BUILD_TOOLCHAIN
+          fi
+          sudo make -j $(nproc) ${{ matrix.mode }}
+
+      - name: tarball build
+        run: tar czvf riscv.tar.gz -C /opt/ riscv/
+      - name: cache tarball for test
+        if: ${{ matrix.compiler }} != 'llvm'
+        uses: actions/cache@v3
+        with:
+          path: riscv.tar.gz
+          key: ${{ matrix.mode }}
+
+      - name: generate prebuilt toolchain name
+        id:   toolchain-name-generator
+        run: |
+          if [[ "${{ matrix.target }}" == *"32"* ]]; then BITS=32; else BITS=64; fi
+          case "${{ matrix.mode }}" in
+            "linux")
+              MODE="glibc";;
+            "musl")
+              MODE="musl";;
+            *)
+              MODE="elf";;
+          esac
+          echo ::set-output name=TOOLCHAIN_NAME::${{ matrix.target }}-$MODE-ubuntu-${{ matrix.compiler }}-nightly
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: ${{ steps.toolchain-name-generator.outputs.TOOLCHAIN_NAME }}
+          path: riscv.tar.gz
+      
+      # Create Release
+      - uses: actions/upload-release-asset@latest
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: riscv.tar.gz
+          asset_name: ${{ steps.toolchain-name-generator.outputs.TOOLCHAIN_NAME }}
+          asset_content_type: application/gzip
+        if: github.event_name == 'workflow_dispatch' || github.event.ref_type == 'tag'
+        # This condition ensures this step only runs for workflow_dispatch events.
+      
+  test-sim:
+    runs-on: ubuntu-latest
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        mode:   [newlib, linux]
+        target: [rv64gcv_zvksc_zvkng-lp64d]
+        sim:    [spike, qemu]
+        exclude:
+          - sim: spike
+            mode: linux
+    steps:
+      - uses: actions/checkout@v3
+      - name: Free Disk Space for LLVM
+        uses: insightsengineering/disk-space-reclaimer@v1
+
+      - name: install dependencies
+        run: sudo ./.github/setup-apt.sh
+
+      - name: restore cached tarball
+        uses: actions/cache/restore@v3
+        with:
+          path: riscv.tar.gz
+          key: ${{ matrix.mode }}
+
+      - name: untar
+        run: sudo tar xf riscv.tar.gz -C /opt
+
+      - name: make report
+        run: make report-${{ matrix.mode }} -j $(nproc)
+
+
+
